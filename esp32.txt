@@ -1,0 +1,153 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+// ==========================================
+// 1. TUS CREDENCIALES
+// ==========================================
+const char* ssid = "tplink";
+const char* password = "TU_CONTRASEÑA_WIFI"; // <--- PON TU CONTRASEÑA
+// Credenciales Bot y Chats
+const char* token_Controlador =
+"8360933379:AAHNP-FsZnyV47LpQVrFEJe_AagmnyqJvt0";
+const char* id_TuChat = "6611005658";
+const char* id_Destino = "-1003368163048";
+// ==========================================
+// 2. LOGICA ENIGMA (Start: A, B, C, D, E)
+// ==========================================
+struct RotorDef { const char* wiring; char notch; char startPos; };
+const RotorDef ROTOR_I = {"EKMFLGDQVZNTOWYHXUSPAIBRCJ", 'Q', 'A'};
+const RotorDef ROTOR_II = {"AJDKSIRUXBLHWTMCQGZNPYFVOE", 'E', 'B'};
+const RotorDef ROTOR_III = {"BDFHJLCPRTXVZNYEIWGAKMUSQO", 'V', 'C'};
+const RotorDef ROTOR_IV = {"ESOVPZJAYQUIRHXLNFTGKDCMWB", 'J', 'D'};
+const RotorDef ROTOR_V = {"VZBRGITYUPSDNHLXAWMJQOFEKC", 'Z', 'E'};
+const char* REFLECTOR_B = "YRUHQSLDPXNGOKMIEBFZCWVJAT";
+class EnigmaRotor {
+public:
+int wiring[26], inverseWiring[26], notchIndex, position=0;
+void configure(const RotorDef& def) {
+notchIndex = def.notch - 'A';
+position = def.startPos - 'A'; // Posición desplazada
+for (int i = 0; i < 26; i++) {
+wiring[i] = def.wiring[i] - 'A';
+inverseWiring[wiring[i]] = i;
+}
+}
+bool isAtNotch() { return position == notchIndex; }
+void step() { position = (position + 1) % 26; }
+int forward(int c) { return (wiring[(c + position) % 26] - position + 26) % 26; }
+int backward(int c) { return (inverseWiring[(c + position) % 26] - position + 26) % 26; }
+};
+class EnigmaMachine {
+private:
+EnigmaRotor activeRotors[5];
+int numRotors = 0;
+int reflector[26];
+int plugboard[26];
+public:
+EnigmaMachine() {
+for(int i=0; i<26; i++) reflector[i] = REFLECTOR_B[i] - 'A';
+for(int i=0; i<26; i++) plugboard[i] = i;
+// PLUGS: JC AF DR EM UZ
+addPlug('J', 'C'); addPlug('A', 'F'); addPlug('D', 'R');
+addPlug('E', 'M'); addPlug('U', 'Z');
+}
+void addPlug(char a, char b) {
+int idxA = a - 'A'; int idxB = b - 'A';
+plugboard[idxA] = idxB; plugboard[idxB] = idxA;
+}
+void setupFromIDString(String ids) {
+numRotors = ids.length(); if (numRotors > 5) numRotors = 5;
+for (int i = 0; i < numRotors; i++) {
+switch(ids[i]) {
+case '1': activeRotors[i].configure(ROTOR_I); break;
+case '2': activeRotors[i].configure(ROTOR_II); break;
+case '3': activeRotors[i].configure(ROTOR_III); break;
+case '4': activeRotors[i].configure(ROTOR_IV); break;
+case '5': activeRotors[i].configure(ROTOR_V); break;
+default: activeRotors[i].configure(ROTOR_I);
+}
+}
+}
+char encryptChar(char input) {
+if (input >= 'A' && input <= 'Z') input += 32;
+if (input < 'a' || input > 'z') return input;
+int c = input - 'a';
+c = plugboard[c];
+// Stepping
+bool shouldStep[5] = {false}; shouldStep[numRotors - 1] = true;
+for (int i = numRotors - 1; i > 0; i--) if (activeRotors[i].isAtNotch() && shouldStep[i])
+shouldStep[i-1] = true;
+for (int i = 0; i < numRotors; i++) if (shouldStep[i]) activeRotors[i].step();
+// Ruta
+for (int i = numRotors - 1; i >= 0; i--) c = activeRotors[i].forward(c);
+c = reflector[c];
+for (int i = 0; i < numRotors; i++) c = activeRotors[i].backward(c);
+c = plugboard[c];
+return c + 'A';
+}
+};
+// ==========================================
+// 3. GESTIÓN DEL BOT
+// ==========================================
+WiFiClientSecure client;
+EnigmaMachine enigma;
+UniversalTelegramBot botControl(token_Controlador, client);
+unsigned long lastTimeBotRan;
+void handleNewMessages(int numNewMessages) {
+for (int i = 0; i < numNewMessages; i++) {
+String chat_id = String(botControl.messages[i].chat_id);
+String text = botControl.messages[i].text;
+if (chat_id != id_TuChat) continue;
+int separatorIndex = text.lastIndexOf('-');
+if (separatorIndex != -1) {
+String mensaje = text.substring(0, separatorIndex);
+String rotoresID = text.substring(separatorIndex + 1);
+rotoresID.trim();
+if (rotoresID.length() >= 3 && rotoresID.length() <= 5) {
+enigma.setupFromIDString(rotoresID);
+String resultado = "";
+for (int k = 0; k < mensaje.length(); k++) resultado += enigma.encryptChar(mensaje[k]);
+// ======================================================
+// AQUI ESTA EL CAMBIO QUE PEDISTE
+// ======================================================
+// 1. Primero mandamos /start al grupo
+botControl.sendMessage(id_Destino, "/start", "");
+// Pequeña pausa para asegurar el orden
+delay(100);
+// 2. Luego mandamos el mensaje cifrado
+String msgFinal = "`" + resultado + "-" + rotoresID + "`";
+bool enviado = botControl.sendMessage(id_Destino, msgFinal, "Markdown");
+// Confirmar a ti en privado
+if (enviado) {
+botControl.sendMessage(chat_id, "✅ Enviado secuencia: /start + Mensaje", "");
+botControl.sendMessage(chat_id, "Contenido: " + msgFinal, "Markdown");
+} else {
+botControl.sendMessage(chat_id, "❌ Error enviando al grupo.", "");
+}
+} else {
+botControl.sendMessage(chat_id, "⚠️ Formato: TEXTO-123", "");
+}
+} else {
+if (text == "/start") botControl.sendMessage(chat_id, "Bot Listo. Envía TEXTO-123", "");
+}
+}
+}
+void setup() {
+Serial.begin(115200);
+WiFi.mode(WIFI_STA);
+WiFi.begin(ssid, password);
+while (WiFi.status() != WL_CONNECTED) delay(500);
+client.setInsecure();
+botControl.sendMessage(id_TuChat, "🚀 Bot Enigma (/start primero) Listo.", "");
+}
+void loop() {
+if (millis() > lastTimeBotRan + 1000) {
+int numNewMessages = botControl.getUpdates(botControl.last_message_received + 1);
+while (numNewMessages) {
+handleNewMessages(numNewMessages);
+numNewMessages = botControl.getUpdates(botControl.last_message_received + 1);
+}
+lastTimeBotRan = millis();
+}
+}
